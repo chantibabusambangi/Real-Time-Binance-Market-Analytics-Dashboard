@@ -1,29 +1,54 @@
+"""
+Database manager for tick data, OHLCV, and analytics storage
+Designed for easy migration to TimescaleDB or InfluxDB
+"""
+
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional
-import asyncio
+from typing import List, Dict, Optional, Tuple
 from threading import Lock
 import json
+import numpy as np
+
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
 
 class DatabaseManager:
     """
-    Manages all database operations for tick data and analytics storage.
-    Designed for easy migration to TimescaleDB or InfluxDB.
+    Manages all database operations with focus on:
+    - High-frequency tick data storage
+    - OHLCV resampled data
+    - Analytics results caching
+    - Alert management
     """
     
-    def __init__(self, db_path: str = "data/trading_data.db"):
+    def __init__(self, db_path: str):
         self.db_path = db_path
         self.lock = Lock()
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_database()
+        logger.info(f"Database initialized at {db_path}")
+    
+    def _get_connection(self):
+        """Get database connection with optimizations"""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # Performance optimizations
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=10000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
     
     def _init_database(self):
         """Initialize database schema"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            # Tick data table
+            # Tick data table - high frequency data
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS tick_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,19 +57,19 @@ class DatabaseManager:
                     price REAL NOT NULL,
                     quantity REAL NOT NULL,
                     is_buyer_maker INTEGER,
+                    trade_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # Create indexes for faster queries
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tick_symbol_timestamp 
-                ON tick_data(symbol, timestamp)
+                CREATE INDEX IF NOT EXISTS idx_tick_symbol_time 
+                ON tick_data(symbol, timestamp DESC)
             """)
             
-            # Resampled data table (OHLCV)
+            # OHLCV resampled data
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS resampled_data (
+                CREATE TABLE IF NOT EXISTS ohlcv_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
                     symbol TEXT NOT NULL,
@@ -54,92 +79,94 @@ class DatabaseManager:
                     low REAL NOT NULL,
                     close REAL NOT NULL,
                     volume REAL NOT NULL,
-                    trade_count INTEGER,
+                    trade_count INTEGER DEFAULT 0,
+                    vwap REAL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(timestamp, symbol, interval)
                 )
             """)
             
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_resampled_symbol_interval_timestamp 
-                ON resampled_data(symbol, interval, timestamp)
+                CREATE INDEX IF NOT EXISTS idx_ohlcv_symbol_interval_time 
+                ON ohlcv_data(symbol, interval, timestamp DESC)
             """)
             
-            # Analytics results table
+            # Analytics results cache
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS analytics_results (
+                CREATE TABLE IF NOT EXISTS analytics_cache (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL NOT NULL,
                     symbol_pair TEXT NOT NULL,
                     interval TEXT NOT NULL,
-                    metric_name TEXT NOT NULL,
-                    metric_value TEXT NOT NULL,
+                    metric_type TEXT NOT NULL,
+                    metric_data TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_analytics_symbol_timestamp 
-                ON analytics_results(symbol_pair, timestamp)
+                CREATE INDEX IF NOT EXISTS idx_analytics_pair_metric 
+                ON analytics_cache(symbol_pair, metric_type, timestamp DESC)
             """)
             
-            # Alerts table
+            # Alerts configuration
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_id TEXT UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
                     symbol_pair TEXT NOT NULL,
                     condition TEXT NOT NULL,
                     threshold REAL NOT NULL,
                     is_active INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_triggered TIMESTAMP
                 )
             """)
             
-            # Alert triggers table
+            # Alert history
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS alert_triggers (
+                CREATE TABLE IF NOT EXISTS alert_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_id TEXT NOT NULL,
                     triggered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     value REAL NOT NULL,
-                    message TEXT
+                    message TEXT,
+                    FOREIGN KEY (alert_id) REFERENCES alerts(alert_id)
                 )
             """)
             
             conn.commit()
+            logger.info("Database schema initialized")
     
-    def insert_tick_data(self, data: List[Dict]):
-        """Insert tick data in batch"""
+    # ========== TICK DATA OPERATIONS ==========
+    
+    def insert_tick_batch(self, ticks: List[Dict]):
+        """Batch insert tick data for performance"""
+        if not ticks:
+            return
+        
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.executemany("""
-                    INSERT INTO tick_data (timestamp, symbol, price, quantity, is_buyer_maker)
-                    VALUES (?, ?, ?, ?, ?)
-                """, [(d['timestamp'], d['symbol'], d['price'], d['quantity'], 
-                       d.get('is_buyer_maker', 0)) for d in data])
+                    INSERT INTO tick_data 
+                    (timestamp, symbol, price, quantity, is_buyer_maker, trade_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, [
+                    (t['timestamp'], t['symbol'], t['price'], t['quantity'],
+                     t.get('is_buyer_maker', 0), t.get('trade_id'))
+                    for t in ticks
+                ])
                 conn.commit()
+        
+        logger.debug(f"Inserted {len(ticks)} ticks")
     
-    def insert_resampled_data(self, data: List[Dict]):
-        """Insert resampled OHLCV data"""
-        with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.executemany("""
-                    INSERT OR REPLACE INTO resampled_data 
-                    (timestamp, symbol, interval, open, high, low, close, volume, trade_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [(d['timestamp'], d['symbol'], d['interval'], d['open'], 
-                       d['high'], d['low'], d['close'], d['volume'], d.get('trade_count', 0)) 
-                       for d in data])
-                conn.commit()
-    
-    def get_tick_data(self, symbol: str, start_time: Optional[float] = None, 
-                      end_time: Optional[float] = None, limit: int = 10000) -> pd.DataFrame:
-        """Retrieve tick data for a symbol"""
+    def get_tick_data(self, symbol: str, start_time: Optional[float] = None,
+                     end_time: Optional[float] = None, limit: int = 10000) -> pd.DataFrame:
+        """Retrieve tick data"""
         query = "SELECT * FROM tick_data WHERE symbol = ?"
-        params = [symbol]
+        params = [symbol.upper()]
         
         if start_time:
             query += " AND timestamp >= ?"
@@ -152,17 +179,49 @@ class DatabaseManager:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
         
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             df = pd.read_sql_query(query, conn, params=params)
         
-        return df.sort_values('timestamp') if not df.empty else df
+        if not df.empty:
+            df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        return df
     
-    def get_resampled_data(self, symbol: str, interval: str, 
-                           start_time: Optional[float] = None, 
-                           limit: int = 1000) -> pd.DataFrame:
-        """Retrieve resampled OHLCV data"""
-        query = "SELECT * FROM resampled_data WHERE symbol = ? AND interval = ?"
-        params = [symbol, interval]
+    def get_recent_ticks(self, symbol: str, seconds: int = 60) -> pd.DataFrame:
+        """Get ticks from last N seconds"""
+        cutoff = datetime.now().timestamp() - seconds
+        return self.get_tick_data(symbol, start_time=cutoff)
+    
+    # ========== OHLCV OPERATIONS ==========
+    
+    def insert_ohlcv_batch(self, ohlcv_list: List[Dict]):
+        """Batch insert OHLCV data"""
+        if not ohlcv_list:
+            return
+        
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.executemany("""
+                    INSERT OR REPLACE INTO ohlcv_data 
+                    (timestamp, symbol, interval, open, high, low, close, volume, trade_count, vwap)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    (o['timestamp'], o['symbol'], o['interval'], o['open'],
+                     o['high'], o['low'], o['close'], o['volume'],
+                     o.get('trade_count', 0), o.get('vwap'))
+                    for o in ohlcv_list
+                ])
+                conn.commit()
+        
+        logger.debug(f"Inserted {len(ohlcv_list)} OHLCV records")
+    
+    def get_ohlcv_data(self, symbol: str, interval: str,
+                       start_time: Optional[float] = None,
+                       limit: int = 1000) -> pd.DataFrame:
+        """Retrieve OHLCV data"""
+        query = "SELECT * FROM ohlcv_data WHERE symbol = ? AND interval = ?"
+        params = [symbol.upper(), interval]
         
         if start_time:
             query += " AND timestamp >= ?"
@@ -171,64 +230,208 @@ class DatabaseManager:
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
         
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             df = pd.read_sql_query(query, conn, params=params)
         
-        return df.sort_values('timestamp') if not df.empty else df
+        if not df.empty:
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+        
+        return df
     
-    def save_analytics_result(self, symbol_pair: str, interval: str, 
-                              timestamp: float, metric_name: str, metric_value: any):
-        """Save analytics result"""
+    def get_latest_ohlcv(self, symbol: str, interval: str) -> Optional[Dict]:
+        """Get most recent OHLCV bar"""
+        query = """
+            SELECT * FROM ohlcv_data 
+            WHERE symbol = ? AND interval = ?
+            ORDER BY timestamp DESC LIMIT 1
+        """
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            result = cursor.execute(query, [symbol.upper(), interval]).fetchone()
+        
+        if result:
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, result))
+        return None
+    
+    def upload_ohlc_file(self, df: pd.DataFrame, symbol: str, interval: str):
+        """Upload OHLC data from CSV/DataFrame"""
+        records = []
+        
+        for idx, row in df.iterrows():
+            # Handle different timestamp formats
+            if 'timestamp' in row:
+                ts = row['timestamp']
+            elif isinstance(idx, pd.Timestamp):
+                ts = idx.timestamp()
+            else:
+                ts = pd.Timestamp(idx).timestamp()
+            
+            records.append({
+                'timestamp': ts,
+                'symbol': symbol.upper(),
+                'interval': interval,
+                'open': float(row['open']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'close': float(row['close']),
+                'volume': float(row['volume']),
+                'trade_count': int(row.get('trade_count', 0)),
+                'vwap': float(row['vwap']) if 'vwap' in row and pd.notna(row['vwap']) else None
+            })
+        
+        self.insert_ohlcv_batch(records)
+        logger.info(f"Uploaded {len(records)} OHLCV records for {symbol}")
+    
+    # ========== ANALYTICS CACHE ==========
+    
+    def save_analytics(self, symbol_pair: str, interval: str,
+                      timestamp: float, metric_type: str, data: Dict):
+        """Save analytics results"""
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO analytics_results 
-                    (timestamp, symbol_pair, interval, metric_name, metric_value)
+                    INSERT INTO analytics_cache 
+                    (timestamp, symbol_pair, interval, metric_type, metric_data)
                     VALUES (?, ?, ?, ?, ?)
-                """, (timestamp, symbol_pair, interval, metric_name, json.dumps(metric_value)))
+                """, (timestamp, symbol_pair, interval, metric_type, json.dumps(data)))
                 conn.commit()
     
-    def get_latest_analytics(self, symbol_pair: str, metric_name: str, 
-                            limit: int = 100) -> pd.DataFrame:
-        """Get latest analytics results"""
+    def get_analytics(self, symbol_pair: str, metric_type: str,
+                     limit: int = 100) -> pd.DataFrame:
+        """Retrieve analytics results"""
         query = """
-            SELECT * FROM analytics_results 
-            WHERE symbol_pair = ? AND metric_name = ?
+            SELECT * FROM analytics_cache 
+            WHERE symbol_pair = ? AND metric_type = ?
             ORDER BY timestamp DESC LIMIT ?
         """
         
-        with sqlite3.connect(self.db_path) as conn:
-            df = pd.read_sql_query(query, conn, params=[symbol_pair, metric_name, limit])
+        with self._get_connection() as conn:
+            df = pd.read_sql_query(query, conn, params=[symbol_pair, metric_type, limit])
         
-        return df.sort_values('timestamp') if not df.empty else df
+        if not df.empty:
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            df['metric_data'] = df['metric_data'].apply(json.loads)
+        
+        return df
     
-    def upload_ohlc_data(self, df: pd.DataFrame, symbol: str, interval: str):
-        """Upload OHLC data from CSV/DataFrame"""
-        records = []
-        for _, row in df.iterrows():
-            records.append({
-                'timestamp': row.get('timestamp', row.name.timestamp() if hasattr(row.name, 'timestamp') else 0),
-                'symbol': symbol,
-                'interval': interval,
-                'open': row['open'],
-                'high': row['high'],
-                'low': row['low'],
-                'close': row['close'],
-                'volume': row['volume'],
-                'trade_count': row.get('trade_count', 0)
-            })
+    # ========== ALERT OPERATIONS ==========
+    
+    def create_alert(self, alert_data: Dict) -> str:
+        """Create new alert"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO alerts 
+                    (alert_id, name, symbol_pair, condition, threshold, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    alert_data['alert_id'],
+                    alert_data['name'],
+                    alert_data['symbol_pair'],
+                    alert_data['condition'],
+                    alert_data['threshold'],
+                    alert_data.get('is_active', 1)
+                ))
+                conn.commit()
         
-        self.insert_resampled_data(records)
+        logger.info(f"Alert created: {alert_data['alert_id']}")
+        return alert_data['alert_id']
+    
+    def get_active_alerts(self) -> List[Dict]:
+        """Get all active alerts"""
+        query = "SELECT * FROM alerts WHERE is_active = 1"
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            results = cursor.execute(query).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+        
+        return [dict(zip(columns, row)) for row in results]
+    
+    def log_alert_trigger(self, alert_id: str, value: float, message: str):
+        """Log alert trigger"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO alert_history (alert_id, value, message)
+                    VALUES (?, ?, ?)
+                """, (alert_id, value, message))
+                
+                cursor.execute("""
+                    UPDATE alerts SET last_triggered = CURRENT_TIMESTAMP
+                    WHERE alert_id = ?
+                """, (alert_id,))
+                
+                conn.commit()
+    
+    def delete_alert(self, alert_id: str):
+        """Delete alert"""
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM alerts WHERE alert_id = ?", (alert_id,))
+                conn.commit()
+    
+    # ========== UTILITY OPERATIONS ==========
+    
+    def get_available_symbols(self) -> List[str]:
+        """Get list of symbols with data"""
+        query = "SELECT DISTINCT symbol FROM ohlcv_data ORDER BY symbol"
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            results = cursor.execute(query).fetchall()
+        
+        return [row[0] for row in results]
+    
+    def get_data_summary(self) -> Dict:
+        """Get summary statistics of stored data"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            tick_count = cursor.execute("SELECT COUNT(*) FROM tick_data").fetchone()[0]
+            ohlcv_count = cursor.execute("SELECT COUNT(*) FROM ohlcv_data").fetchone()[0]
+            symbols = cursor.execute("SELECT COUNT(DISTINCT symbol) FROM ohlcv_data").fetchone()[0]
+            
+            oldest_tick = cursor.execute(
+                "SELECT MIN(timestamp) FROM tick_data"
+            ).fetchone()[0]
+            
+            latest_tick = cursor.execute(
+                "SELECT MAX(timestamp) FROM tick_data"
+            ).fetchone()[0]
+        
+        return {
+            'tick_count': tick_count,
+            'ohlcv_count': ohlcv_count,
+            'symbol_count': symbols,
+            'oldest_timestamp': oldest_tick,
+            'latest_timestamp': latest_tick,
+            'data_span_hours': (latest_tick - oldest_tick) / 3600 if oldest_tick and latest_tick else 0
+        }
     
     def cleanup_old_data(self, days: int = 7):
         """Clean up data older than specified days"""
-        cutoff_time = (datetime.now() - timedelta(days=days)).timestamp()
+        cutoff = (datetime.now() - timedelta(days=days)).timestamp()
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM tick_data WHERE timestamp < ?", (cutoff_time,))
-                cursor.execute("DELETE FROM resampled_data WHERE timestamp < ?", (cutoff_time,))
-                cursor.execute("DELETE FROM analytics_results WHERE timestamp < ?", (cutoff_time,))
+                
+                deleted_ticks = cursor.execute(
+                    "DELETE FROM tick_data WHERE timestamp < ?", (cutoff,)
+                ).rowcount
+                
+                deleted_ohlcv = cursor.execute(
+                    "DELETE FROM ohlcv_data WHERE timestamp < ?", (cutoff,)
+                ).rowcount
+                
                 conn.commit()
+        
+        logger.info(f"Cleaned up {deleted_ticks} ticks and {deleted_ohlcv} OHLCV records")
